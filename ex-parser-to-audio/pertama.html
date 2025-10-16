@@ -1,0 +1,583 @@
+
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Contoh ke Audio - pertama - by ChatGPT</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 18px; color:#111; background:#f6f7f9; }
+  pre { background:#fff; padding:12px; border:1px solid #ddd; overflow:auto; max-height:320px; }
+  button { margin:6px; padding:8px 12px; }
+  label { display:block; margin-top:8px; font-weight:600; }
+  .controls { margin-bottom:12px; }
+  .status { margin-top:8px; color:#444; }
+</style>
+</head>
+<body>
+  <h2>JSON Score Player — seq / poly / ref / voice+ADSR</h2>
+
+  <div class="controls">
+    <button id="btnLoad">Load Example</button>
+    <button id="btnPlay">Play</button>
+    <button id="btnStop">Stop</button>
+  </div>
+
+  <label>Score (JSON)</label>
+  <pre id="jsonArea" contenteditable="true" spellcheck="false"></pre>
+
+  <label>Voices (registry)</label>
+  <pre id="voicesArea" contenteditable="true" spellcheck="false"></pre>
+
+  <div class="status" id="status">Status: siap</div>
+
+<script>
+/*
+  JSON Score Player
+  - Traverses the JSON tree, resolves ids and refs.
+  - Builds a timeline of "events" {timeSeconds, durSeconds, freq, gain, voice, isRest}
+  - Uses Web Audio API to schedule oscillator + gain node with ADSR.
+  - Voice registry defines oscillator type and ADSR (attack, decay, sustain, release).
+*/
+
+/* ----------------------------
+   Default example score & voices
+   ---------------------------- */
+const defaultScore = {
+  "tag": "poly",
+  "bpm": 100,
+  "et": 12,
+  "mode": [0,2,4,5,7,9,11],
+  "tonic": 261.63,
+  "child": [
+    {
+      "tag": "seq",
+      "id": "melodi",
+      "notes": [
+        {"i":0,"d":1},
+        {"i":1,"d":1},
+        {"i":2,"d":1},
+        {"i":3,"d":1},
+        {"i":4,"d":2}
+      ],
+      "child":[
+        {
+          "tag":"seq",
+          "id":"melodi-bridge",
+          "notes":[
+            {"i":4,"d":1},
+            {"i":5,"d":1}
+          ]
+        }
+      ]
+    },
+    {
+      "tag": "seq",
+      "id": "melodiBerseri",
+      "notes": [
+        {"t":0,"ref":"melodi"},  /* contoh pemanggilan ref lewat object note; optional */
+        {"t":4,"i":4,"d":4}
+      ]
+    },
+    {
+      "tag": "seq",
+      "id": "pengiring",
+      "notes": [
+        {"i":0,"o":-1,"d":8,"v":0.6}
+      ]
+    }
+  ]
+};
+
+const defaultVoices = {
+  "lead": { "type":"sawtooth", "adsr": { "a":0.01, "d":0.08, "s":0.85, "r":0.12 } },
+  "pad":  { "type":"sine",     "adsr": { "a":0.02, "d":0.2,  "s":0.7,  "r":0.5  } }
+};
+
+/* ----------------------------
+   UI references
+   ---------------------------- */
+const jsonArea = document.getElementById('jsonArea');
+const voicesArea = document.getElementById('voicesArea');
+const btnLoad = document.getElementById('btnLoad');
+const btnPlay = document.getElementById('btnPlay');
+const btnStop = document.getElementById('btnStop');
+const statusEl = document.getElementById('status');
+
+jsonArea.textContent = JSON.stringify(defaultScore, null, 2);
+voicesArea.textContent = JSON.stringify(defaultVoices, null, 2);
+
+/* ----------------------------
+   Audio context and state
+   ---------------------------- */
+let audioCtx = null;
+let masterGain = null;
+let scheduledNodes = []; // untuk penghentian
+let startTimeAbsolute = 0;
+let isPlaying = false;
+
+/* ----------------------------
+   Utilities: config merging and cloning
+   ---------------------------- */
+function shallowClone(o){ return Object.assign({}, o); }
+function mergeConfig(parent, child){
+  if(!parent) return shallowClone(child || {});
+  if(!child) return shallowClone(parent);
+  const out = shallowClone(parent);
+  for(const k of Object.keys(child)) out[k] = child[k];
+  return out;
+}
+
+/* ----------------------------
+   Frequency calculation
+   - et: equal temperament divisions per octave (contoh 12)
+   - tonic: frequency of step 0 at octave base (o = 0)
+   - semitoneSteps: integer or float steps (can be negative)
+   freq = tonic * 2^(semitoneSteps / et)
+   ---------------------------- */
+function stepsToFreq(steps, et, tonic){
+  return tonic * Math.pow(2, steps / et);
+}
+
+/* ----------------------------
+   Timeline builder
+   - Walks the JSON tree and emits events: {timeBeat, durBeat, freq, vel, voiceName, isRest}
+   - Inherited config fields: et, mode, bpm, tonic, voice, radix
+   - Behavior of tags:
+       seq: children played sequentially
+       poly: children played in parallel (all relative to parent's start)
+       group: does not affect time, only merges config into children
+       ref: node that references an element by id -> schedule that element with properties overridden
+   - notes arrays: each object may have t (explicit beat offset), or if t omitted then sequential within that notes array.
+   - seq/poly can have both notes and child; notes are treated as children.
+   - loop: integer times to repeat (default 1)
+   ---------------------------- */
+function buildTimeline(root) {
+  const idMap = new Map();
+
+  // First pass: collect id -> node references (shallow)
+  (function collect(node){
+    if(node && typeof node === 'object'){
+      if(node.id) idMap.set(node.id, node);
+      const arr = node.child;
+      if(Array.isArray(arr)) for(const c of arr) collect(c);
+      // notes may contain objects with tag:ref or nested refs
+      if(Array.isArray(node.notes)) for(const n of node.notes) {
+        if(n && typeof n === 'object' && n.tag && n.tag === 'ref' && n.ref) {
+          // nothing to collect now
+        }
+      }
+    }
+  })(root);
+
+  const events = []; // {timeBeat, durBeat, freq, vel, voice, isRest}
+  // helper to schedule a node at a given startBeat with config
+  function scheduleNode(node, parentConfig, startBeat){
+    const cfg = mergeConfig(parentConfig, node || {});
+    const et = cfg.et == null ? 12 : cfg.et;
+    const mode = Array.isArray(cfg.mode) ? cfg.mode.slice() : [0,2,4,5,7,9,11];
+    const bpm = cfg.bpm == null ? 100 : cfg.bpm;
+    const tonic = cfg.tonic == null ? 261.63 : cfg.tonic;
+    const voice = cfg.voice || null;
+    const radix = cfg.radix || 10;
+    const loop = Number.isFinite(node && node.loop) ? node.loop : (Number.isFinite(cfg.loop) ? cfg.loop : 1);
+
+    // Helper: resolve a single note-object and push to events
+    function emitNoteObj(noteObj, baseBeatOffset){
+      // noteObj may include 'tag: ref' or direct properties
+      if(noteObj && noteObj.tag === 'ref' && noteObj.ref){
+        // create a synthetic node invocation: copy referenced node and override with noteObj props except tag & ref
+        const referenced = idMap.get(noteObj.ref);
+        if(!referenced){
+          console.warn('ref target not found:', noteObj.ref);
+          return;
+        }
+        const override = shallowClone(noteObj);
+        delete override.tag; delete override.ref;
+        // Merge override into referenced call and schedule at baseBeatOffset
+        scheduleNode(mergeConfig(referenced, override), cfg, baseBeatOffset);
+        return;
+      }
+
+      if(noteObj && noteObj.r != null){
+        // rest
+        const dur = Number(noteObj.r) || 0;
+        events.push({
+          timeBeat: baseBeatOffset,
+          durBeat: dur,
+          isRest: true,
+          voice: voice,
+        });
+        return;
+      }
+
+      if(!noteObj) return;
+
+      // Determine start time: if noteObj.t specified, it's relative to container; else use supplied baseBeatOffset
+      let noteStart = (noteObj.t != null) ? (baseBeatOffset + Number(noteObj.t)) : baseBeatOffset;
+
+      // duration d required for sounding notes
+      const dur = (noteObj.d != null) ? Number(noteObj.d) : 0;
+      const vel = (noteObj.v != null) ? Number(noteObj.v) : 1;
+
+      // Determine semitone steps from root:
+      let semitoneSteps = 0;
+      if(noteObj.n != null){
+        // direct ET step value (may be fractional)
+        semitoneSteps = Number(noteObj.n);
+        const octaveOffset = Number(noteObj.o || 0) * et;
+        semitoneSteps += octaveOffset;
+      } else if(noteObj.i != null){
+        // index into mode array
+        const idx = Number(noteObj.i);
+        const base = (mode[idx] != null) ? Number(mode[idx]) : 0;
+        const octaveOffset = Number(noteObj.o || 0) * et;
+        semitoneSteps = base + octaveOffset;
+      } else {
+        // If neither n nor i, treat as rest if dur>0 else ignore
+        if(dur > 0){
+          events.push({
+            timeBeat: noteStart,
+            durBeat: dur,
+            isRest: true,
+            voice: voice
+          });
+        }
+        return;
+      }
+
+      const freq = stepsToFreq(semitoneSteps, et, tonic);
+
+      events.push({
+        timeBeat: noteStart,
+        durBeat: dur,
+        freq: freq,
+        vel: vel,
+        voice: voice,
+        isRest: false
+      });
+    }
+
+    // A node may contain notes[] and/or child[]
+    // For seq: execute children sequentially (unless t provided)
+    // For poly: execute children with same startBeat
+    const tag = node && node.tag ? node.tag : 'seq';
+    const notesArray = Array.isArray(node && node.notes) ? node.notes : null;
+    const childArray = Array.isArray(node && node.child) ? node.child : null;
+
+    // Helper to process notes array according to seq/poly behavior
+    function processNotesArray(notesArr, elementStartBeat, elementTag){
+      if(!notesArr) return;
+      if(elementTag === 'poly'){
+        // play all notes with their t if present, else start at elementStartBeat
+        for(const n of notesArr){
+          if(n && n.t != null){
+            emitNoteObj(n, elementStartBeat); // emitNoteObj handles n.t itself
+          } else {
+            emitNoteObj(n, elementStartBeat);
+          }
+        }
+      } else {
+        // seq: iterate sequentially; if note has t then absolute relative value; else place after previous
+        let cursor = elementStartBeat;
+        for(const n of notesArr){
+          if(n && n.t != null){
+            // explicit time relative to elementStartBeat
+            emitNoteObj(n, elementStartBeat);
+            // update cursor to max(cursor, t + d)
+            const end = elementStartBeat + Number(n.t) + (Number(n.d) || 0);
+            if(end > cursor) cursor = end;
+          } else {
+            // start at cursor
+            emitNoteObj(Object.assign({}, n), cursor);
+            const dur = Number(n.d) || 0;
+            cursor += dur;
+          }
+        }
+      }
+    }
+
+    // Process loop iterations
+    for(let rep=0; rep<Math.max(1, loop); rep++){
+      const loopOffset = rep * (node._estimatedLengthBeat || 0); // if previously computed estimated length, use it
+      const elementStartBeat = startBeat + loopOffset;
+
+      if(tag === 'poly'){
+        // For poly, notes and children start at elementStartBeat
+        processNotesArray(notesArray, elementStartBeat, 'poly');
+        if(childArray){
+          for(const ch of childArray){
+            scheduleNode(ch, cfg, elementStartBeat);
+          }
+        }
+      } else if(tag === 'group'){
+        // group does not impose temporal rules: just schedule children with the same startBeat
+        processNotesArray(notesArray, elementStartBeat, 'poly'); // treat notes in group as parallel
+        if(childArray){
+          for(const ch of childArray){
+            scheduleNode(ch, cfg, elementStartBeat);
+          }
+        }
+      } else { // default seq
+        // seq: iterate notes then children sequentially
+        // For seq, we must compute internal cursor
+        let cursor = elementStartBeat;
+
+        // notes first
+        if(notesArray){
+          for(const n of notesArray){
+            if(n && n.t != null){
+              // explicit beat relative to elementStartBeat
+              emitNoteObj(n, elementStartBeat);
+              const end = elementStartBeat + Number(n.t) + (Number(n.d) || 0);
+              if(end > cursor) cursor = end;
+            } else {
+              // implicit sequential
+              emitNoteObj(Object.assign({}, n), cursor);
+              const dur = Number(n.d) || (n.r != null ? Number(n.r) : 0) || 0;
+              cursor += dur;
+            }
+          }
+        }
+
+        // then children
+        if(childArray){
+          for(const ch of childArray){
+            scheduleNode(ch, cfg, cursor);
+            // advance cursor by estimated length of child if possible
+            const len = estimateNodeLengthBeat(ch, cfg);
+            cursor += len;
+          }
+        }
+      }
+    }
+  }
+
+  // estimate length (in beats) for node to support seq cursor and loop offsets
+  function estimateNodeLengthBeat(node, parentCfg){
+    if(!node) return 0;
+    const cfg = mergeConfig(parentCfg, node || {});
+    const tag = node.tag || 'seq';
+    let length = 0;
+
+    // notes
+    if(Array.isArray(node.notes)){
+      if(tag === 'poly' || tag === 'group'){
+        // length is max(t + d) among notes
+        let maxEnd = 0;
+        for(const n of node.notes){
+          const t = (n && n.t != null) ? Number(n.t) : 0;
+          const d = (n && n.d != null) ? Number(n.d) : (n && n.r != null ? Number(n.r) : 0);
+          const end = t + d;
+          if(end > maxEnd) maxEnd = end;
+        }
+        length = Math.max(length, maxEnd);
+      } else {
+        // seq: sum durations, respecting t where present
+        let cursor = 0;
+        for(const n of node.notes){
+          if(n && n.t != null){
+            const end = Number(n.t) + (Number(n.d) || (n.r!=null ? Number(n.r) : 0) || 0);
+            if(end > cursor) cursor = end;
+          } else {
+            const dur = Number(n.d) || (n.r!=null ? Number(n.r) : 0) || 0;
+            cursor += dur;
+          }
+        }
+        length = Math.max(length, cursor);
+      }
+    }
+
+    // children
+    if(Array.isArray(node.child)){
+      if(tag === 'poly' || tag === 'group'){
+        // parallel: length is max child length
+        let mx = 0;
+        for(const ch of node.child){
+          const L = estimateNodeLengthBeat(ch, cfg);
+          if(L > mx) mx = L;
+        }
+        length = Math.max(length, mx);
+      } else {
+        // seq: sum child lengths
+        let sum = 0;
+        for(const ch of node.child){
+          const L = estimateNodeLengthBeat(ch, cfg);
+          sum += L;
+        }
+        length = Math.max(length, length + sum);
+      }
+    }
+
+    // if node has loop, multiply
+    const loop = Number.isFinite(node.loop) ? node.loop : (Number.isFinite(cfg.loop) ? cfg.loop : 1);
+    node._estimatedLengthBeat = length * Math.max(1, loop);
+    return node._estimatedLengthBeat;
+  }
+
+  // start recursion
+  estimateNodeLengthBeat(root, {});
+  scheduleNode(root, {}, 0);
+
+  // events currently in beats; return them and global bpm for conversion later
+  return { events, bpm: (root.bpm || 100) };
+}
+
+/* ----------------------------
+   Playback: schedule events in WebAudio
+   - Convert beats to seconds: seconds = (60 / bpm) * beat
+   - For each event: if isRest skip but respect time, else create oscillator + gain, apply ADSR
+   - Voice registry must be provided
+   ---------------------------- */
+function ensureAudio(){
+  if(!audioCtx){
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.9;
+    masterGain.connect(audioCtx.destination);
+  }
+}
+
+function scheduleEvents(timeline, voiceRegistry){
+  ensureAudio();
+  const bpm = timeline.bpm || 100;
+  const secondsPerBeat = 60 / bpm;
+  startTimeAbsolute = audioCtx.currentTime + 0.05; // small offset
+  scheduledNodes = [];
+
+  for(const ev of timeline.events){
+    const startSec = startTimeAbsolute + (ev.timeBeat * secondsPerBeat);
+    const durSec = (ev.durBeat || 0) * secondsPerBeat;
+
+    if(ev.isRest) continue;
+
+    const vname = ev.voice || Object.keys(voiceRegistry)[0]; // default to first voice
+    const voice = voiceRegistry[vname] || voiceRegistry[Object.keys(voiceRegistry)[0]];
+    if(!voice){
+      console.warn('Voice not found for event; skipping', vname);
+      continue;
+    }
+
+    // oscillator & gain
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+
+    // oscillator type
+    osc.type = voice.type || 'sine';
+    // set frequency
+    osc.frequency.setValueAtTime(ev.freq, startSec);
+
+    // ADSR application
+    const a = (voice.adsr && Number(voice.adsr.a)) ? Number(voice.adsr.a) : 0.01;
+    const d = (voice.adsr && Number(voice.adsr.d)) ? Number(voice.adsr.d) : 0.1;
+    const s = (voice.adsr && Number(voice.adsr.s)) ? Number(voice.adsr.s) : 0.8;
+    const r = (voice.adsr && Number(voice.adsr.r)) ? Number(voice.adsr.r) : 0.2;
+
+    // initial gain 0
+    g.gain.setValueAtTime(0.0, startSec);
+    // attack
+    g.gain.linearRampToValueAtTime(ev.vel || 1.0, startSec + a);
+    // decay -> sustain level
+    g.gain.linearRampToValueAtTime((ev.vel || 1.0) * s, startSec + a + d);
+    // release scheduled at note end
+    const releaseStart = startSec + Math.max(0.0001, durSec); // if dur 0 => immediate release
+    g.gain.cancelScheduledValues(releaseStart);
+    g.gain.setValueAtTime(g.gain.value, releaseStart);
+    g.gain.linearRampToValueAtTime(0.0, releaseStart + r);
+
+    osc.connect(g);
+    g.connect(masterGain);
+
+    // start & stop oscillators
+    osc.start(startSec);
+    // stop a bit after release end to ensure ramp finishes
+    const stopAt = releaseStart + r + 0.05;
+    osc.stop(stopAt);
+
+    scheduledNodes.push({ osc, g });
+  }
+}
+
+/* ----------------------------
+   High-level controls
+   ---------------------------- */
+function parseVoices(text){
+  try {
+    const v = JSON.parse(text);
+    // validation: each voice should have type and adsr object
+    for(const k of Object.keys(v)){
+      if(!v[k].type) v[k].type = 'sine';
+      if(!v[k].adsr) v[k].adsr = { a:0.01,d:0.1,s:0.8,r:0.2 };
+    }
+    return v;
+  } catch(e){
+    throw new Error('Gagal mengurai voices JSON: ' + e.message);
+  }
+}
+
+function parseScore(text){
+  try {
+    const s = JSON.parse(text);
+    return s;
+  } catch(e){
+    throw new Error('Gagal mengurai score JSON: ' + e.message);
+  }
+}
+
+function stopAll(){
+  if(!audioCtx) return;
+  for(const n of scheduledNodes){
+    try { n.osc.disconnect(); n.g.disconnect(); } catch(e){}
+  }
+  scheduledNodes = [];
+  // optionally close context (but keep for re-use)
+  // audioCtx.close(); audioCtx = null;
+}
+
+/* ----------------------------
+   Button handlers
+   ---------------------------- */
+btnLoad.addEventListener('click', () => {
+  jsonArea.textContent = JSON.stringify(defaultScore, null, 2);
+  voicesArea.textContent = JSON.stringify(defaultVoices, null, 2);
+  statusEl.textContent = 'Status: contoh dimuat';
+});
+
+btnPlay.addEventListener('click', async () => {
+  // resume context if needed
+  try{
+    const voiceRegistry = parseVoices(voicesArea.textContent);
+    const score = parseScore(jsonArea.textContent);
+
+    if(!audioCtx) ensureAudio();
+    if(audioCtx.state === 'suspended') await audioCtx.resume();
+
+    const timeline = buildTimeline(score);
+
+    scheduleEvents(timeline, voiceRegistry);
+    isPlaying = true;
+    statusEl.textContent = 'Status: bermain';
+  }catch(err){
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+});
+
+btnStop.addEventListener('click', () => {
+  stopAll();
+  isPlaying = false;
+  statusEl.textContent = 'Status: berhenti';
+});
+
+/* ----------------------------
+   Notes on usage and extension (ringkas):
+   - Untuk nada menggunakan indeks mode: {"i":0,"d":1,"o":0}
+   - Untuk nada ET langsung: {"n":7.5,"d":1}
+   - Rest: {"r":1}
+   - ref: {"tag":"ref","ref":"melodi"} atau sebagai note object
+   - loop pada node: "loop": 2
+   - voice: set "voice":"lead" pada node atau gunakan root config to set default voice
+   - voice registry: setiap voice {type: "sine"|"square"|"sawtooth"|"triangle", adsr:{a,d,s,r}}
+   ---------------------------- */
+</script>
+</body>
+</html>
